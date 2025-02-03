@@ -1,0 +1,712 @@
+import sys
+import numpy as np
+import pandas as pd
+import requests
+import os
+import time
+import hmac
+import hashlib
+import json
+
+print("User Current Version:-", sys.version)
+
+n_cpu = os.cpu_count()
+print("Number of CPUs in the system:", n_cpu)
+
+BASE_URL = "https://api.binance.com"
+API_KEY = <API_KEY>
+API_SECRET = <API_SECRET>
+NUM_OF_CONS_ERROR = 0
+
+
+class parametreler:
+    PRICE_FILTER = 0
+    LOT_SIZE = 0
+    BEKLEME_SURESI = 10
+    ALIM_SATIM_DERINLIGI = 500
+    ALIM_SATIM_MAX_DERINLIK = 5000  # 5000 max değeri
+    STOP_LOSS_SINIRI = 300
+    HATA_ALINDIGINDA_BEKLEME_SURESI = 120
+    HATALI_DURUM_DENEME_SAYISI_SINIRI = 5
+    HO_PERIYOT = 7
+    KLINE_SPAN = "15d"
+    MAX_ALLOWED_WEIGHT = 1000
+    WAIT_TIME_FOR_WEIGHT = 30
+    LOW_RATIO_LEVEL = 0.66
+    HIGH_RATIO_LEVEL = 1.5
+    ORDER_BOOK_HISTOGRAM_BANDI = 500
+    WEIGHT_TRACKER = np.zeros((1, 2))
+    WEIGHT_BUFFER = 200
+
+    ws_event_type = "e"
+    ws_event_time = "E"
+    ws_symbol = "s"
+    ws_status = "X"
+    ws_orderId = "i"
+    ws_transactionTime = "T"
+    ws_orderCreationTime = "O"
+    ws_lastExecutedPrice = "L"
+    ws_lastExecutedQuantity = "l"
+    ws_side = "S"
+    ws_orderPrice = "p"
+    ws_balancesArray = "B"
+    ws_asset = "a"
+    ws_free = "f"
+    ws_lock = "l"
+    ws_cumulativeFilledQuantity = "z"
+    ws_kline_start_time = "t"
+    ws_kline_close_time = "T"
+    ws_kline_symbol = "s"
+    ws_kline_interval = "i"
+    ws_kline_open_price = "o"
+    ws_kline_close_price = "c"
+    ws_kline_high_price = "h"
+    ws_kline_low_price = "l"
+    ws_kline_base_asset_volume = "v"
+    ws_kline_number_of_trades = "n"
+    ws_kline_is_closed = "x"
+    ws_kline_quote_asset_volume = "q"
+    ws_kline_taker_buy_base_Asset_volume = "V"
+    ws_kline_taker_buy_quote_asset_volume = "Q"
+    ws_orderbook_first_update_id = "U"
+    ws_orderbook_final_update_id = "u"
+    ws_orderbook_asks = "a"
+    ws_orderbook_bids = "b"
+    ws_priceticker_price = "p"
+    ws_priceticker_trade_time = "T"
+    ws_priceticker_is_buyer_maker = "m"
+
+
+def getTimestampDiff():
+    try:
+        url = "https://api.binance.com/api/v3/time"
+        r = requests.get(url, stream=True)
+        if r.status_code == 200:
+            result = json.loads(r.content)
+            timestampDiff = time.time() * 1000 - result["serverTime"]
+        else:
+            print(r)
+            timestampDiff = 0
+        NUM_OF_CONS_ERROR = 0
+    except requests.exceptions.RequestException as e:
+        NUM_OF_CONS_ERROR = NUM_OF_CONS_ERROR+1
+        if NUM_OF_CONS_ERROR == parametreler.HATALI_DURUM_DENEME_SAYISI_SINIRI:
+            SystemExit()
+        else:
+            print(Back.RED + "Error Connecting:" + Back.RESET, e)
+            time.sleep(
+                parametreler.HATA_ALINDIGINDA_BEKLEME_SURESI)
+            getTimestampDiff()
+    return timestampDiff
+
+
+TIMESTAMP_DIFF = getTimestampDiff()
+
+
+def getKlineInfosWithAPI(symbolPair, startTime, endTime, interval=parametreler.KLINE_SPAN, limit=parametreler.HO_PERIYOT):
+    try:
+        sonuc = pd.DataFrame()
+        totalWeightUsed = 0
+        queryPath = "symbol="+symbolPair+"&interval=" + \
+            interval + "&limit=" + str(limit)
+        if startTime > 0:
+            queryPath = queryPath + "&startTime=" + str(startTime)
+        if endTime > 0:
+            queryPath = queryPath + "&endTime=" + str(endTime)
+        url = BASE_URL + "/api/v3/klines?" + queryPath
+        r = requests.get(url)
+        if r.status_code == 200:
+            sonuc = json.loads(r.content)
+            totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+            if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+                time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+            sonuc = pd.DataFrame(sonuc, columns=['Open_time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Close_time', 'Quote_asset_volume',
+                                                 'Number_of_trades', 'Taker_buy_base_asset_volume', 'Taker_buy_quote_asset_volume', 'Ignore'])
+            sonuc["Symbol"] = symbolPair
+        else:
+            print(r)
+        NUM_OF_CONS_ERROR = 0
+    except requests.exceptions.RequestException as e:
+        NUM_OF_CONS_ERROR = NUM_OF_CONS_ERROR+1
+        if NUM_OF_CONS_ERROR == parametreler.HATALI_DURUM_DENEME_SAYISI_SINIRI:
+            SystemExit()
+        else:
+            print(Back.RED + "Error Connecting:" + Back.RESET, e)
+            time.sleep(
+                parametreler.HATA_ALINDIGINDA_BEKLEME_SURESI)
+            getKlineInfosWithAPI(symbolPair, startTime, interval, limit)
+    return sonuc, totalWeightUsed
+
+
+def getPriceWithAPI(symbol=""):
+    NUM_OF_CONS_ERROR = 0
+    try:
+        sonuc = pd.DataFrame()
+        totalWeightUsed = 0
+        queryPath = "/api/v3/ticker/price"
+        if len(symbol) > 0:
+            queryPath = queryPath + "?symbol=" + symbol
+        url = BASE_URL + queryPath
+        r = requests.get(url)
+        if r.status_code == 200:
+            sonuc = json.loads(r.content)
+            totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+        else:
+            print(r)
+        if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+            time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+        NUM_OF_CONS_ERROR = 0
+    except requests.exceptions.RequestException as e:
+        NUM_OF_CONS_ERROR = NUM_OF_CONS_ERROR+1
+        if NUM_OF_CONS_ERROR == parametreler.HATALI_DURUM_DENEME_SAYISI_SINIRI:
+            SystemExit()
+        else:
+            print(Back.RED + "Error Connecting:" + Back.RESET, e)
+            time.sleep(
+                parametreler.HATA_ALINDIGINDA_BEKLEME_SURESI)
+            getPriceWithAPI(symbol)
+    return sonuc, totalWeightUsed
+
+
+def getCommissionRate(symbol):
+    try:
+        sonuc = pd.DataFrame()
+        totalWeightUsed = 0
+        queryPath = "/api/v3/account/commission"
+        queryPath = queryPath + "?symbol=" + symbol
+        url = BASE_URL + queryPath
+        r = requests.get(url)
+
+        timestamp = int((time.time() * 1000 - TIMESTAMP_DIFF))
+        queryPath = ("timestamp=" + str(timestamp))+"&symbol=" + symbol
+        signature = getSignature(api_secret=API_SECRET,
+                                 message=queryPath.encode('utf-8'))
+        queryPath = queryPath + "&signature=" + signature
+        url = BASE_URL + "/api/v3/account/commission?" + queryPath
+        r = requests.get(url, headers={'X-MBX-APIKEY': API_KEY})
+        if r.status_code == 200:
+            sonuc = pd.DataFrame(json.loads(r.content))
+            totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+        else:
+            print(r)
+        if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+            time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+        NUM_OF_CONS_ERROR = 0
+    except requests.exceptions.RequestException as e:
+        NUM_OF_CONS_ERROR = NUM_OF_CONS_ERROR+1
+        if NUM_OF_CONS_ERROR == parametreler.HATALI_DURUM_DENEME_SAYISI_SINIRI:
+            SystemExit()
+        else:
+            print(Back.RED + "Error Connecting:" + Back.RESET, e)
+            time.sleep(
+                parametreler.HATA_ALINDIGINDA_BEKLEME_SURESI)
+            getCommissionRate(symbol)
+    return sonuc, totalWeightUsed
+
+
+def get24hourWithAPI():
+    try:
+        sonuc = pd.DataFrame()
+        totalWeightUsed = 0
+        queryPath = "/api/v3/ticker/24hr"
+        url = BASE_URL+queryPath
+        r = requests.get(url)
+        if r.status_code == 200:
+            sonuc = json.loads(r.content)
+            totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+            if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+                time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+            sonuc = pd.DataFrame(sonuc)
+        else:
+            print(r)
+        NUM_OF_CONS_ERROR = 0
+    except requests.exceptions.RequestException as e:
+        NUM_OF_CONS_ERROR = NUM_OF_CONS_ERROR+1
+        if NUM_OF_CONS_ERROR == parametreler.HATALI_DURUM_DENEME_SAYISI_SINIRI:
+            SystemExit()
+        else:
+            print(Back.RED + "Error Connecting:" + Back.RESET, e)
+            time.sleep(
+                parametreler.HATA_ALINDIGINDA_BEKLEME_SURESI)
+            get24hourWithAPI()
+    return sonuc, totalWeightUsed
+
+
+def getSignature(api_secret=API_SECRET, message=""):
+    signature = hmac.new(api_secret, message, hashlib.sha256).hexdigest()
+    return signature
+
+
+def getOpenOrders(symbol="", clientOrderId="", getAllOrders=True):
+    openOrders = {}
+    totalWeightUsed = 0
+    try:
+        if getAllOrders:
+            timestamp = int((time.time() * 1000 - TIMESTAMP_DIFF))
+            queryPath = ("timestamp=" + str(timestamp))
+            signature = getSignature(api_secret=API_SECRET,
+                                     message=queryPath.encode('utf-8'))
+            queryPath = queryPath + "&signature=" + signature
+            url = BASE_URL + "/api/v3/openOrders?" + queryPath
+            r = requests.get(url, headers={'X-MBX-APIKEY': API_KEY})
+            if r.status_code == 200:
+                openOrders = json.loads(r.content)
+                totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+            else:
+                print(r)
+            if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+                time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+        else:
+            timestamp = int((time.time() * 1000 - TIMESTAMP_DIFF))
+            queryPath = ("timestamp=" + str(timestamp))+"&symbol=" + \
+                symbol + "&origClientOrderId=" + clientOrderId
+            signature = getSignature(api_secret=API_SECRET,
+                                     message=queryPath.encode('utf-8'))
+            queryPath = queryPath + "&signature=" + signature
+            url = BASE_URL + "/api/v3/order?" + queryPath
+            r = requests.get(url, headers={'X-MBX-APIKEY': API_KEY})
+            if r.status_code == 200:
+                openOrders = json.loads(r.content)
+                totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+            else:
+                print(r)
+            if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+                time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+        NUM_OF_CONS_ERROR = 0
+    except requests.exceptions.RequestException as e:
+        NUM_OF_CONS_ERROR = NUM_OF_CONS_ERROR+1
+        if NUM_OF_CONS_ERROR == parametreler.HATALI_DURUM_DENEME_SAYISI_SINIRI:
+            SystemExit()
+        else:
+            print(Back.RED + "Error Connecting:" + Back.RESET, e)
+            time.sleep(
+                parametreler.HATA_ALINDIGINDA_BEKLEME_SURESI)
+            getOpenOrders(symbol, clientOrderId, getAllOrders)
+    return openOrders, totalWeightUsed
+
+
+def getExchangeSymbols():
+    totalWeightUsed = 0
+    try:
+        url = BASE_URL + "/api/v1/exchangeInfo"
+        r = requests.get(url)
+        if r.status_code == 200:
+            result = json.loads(r.content)
+            totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+        else:
+            print(r)
+        if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+            time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+        NUM_OF_CONS_ERROR = 0
+    except requests.exceptions.RequestException as e:
+        NUM_OF_CONS_ERROR = NUM_OF_CONS_ERROR+1
+        if NUM_OF_CONS_ERROR == parametreler.HATALI_DURUM_DENEME_SAYISI_SINIRI:
+            SystemExit()
+        else:
+            print(Back.RED + "Error Connecting:" + Back.RESET, e)
+            time.sleep(
+                parametreler.HATA_ALINDIGINDA_BEKLEME_SURESI)
+            getExchangeSymbols()
+    return result, totalWeightUsed
+
+
+def getAveragePrice(baseAsset, quoteAsset):
+    try:
+        price = -1
+        queryPath = "symbol=" + baseAsset + quoteAsset
+        url = BASE_URL + "/api/v3/avgPrice?" + queryPath
+        r = requests.get(url)
+        if r.status_code == 200:
+            result = json.loads(r.content)
+            price = float(result["price"])
+        else:
+            print(r)
+        totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+        if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+            time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+        NUM_OF_CONS_ERROR = 0
+    except requests.exceptions.RequestException as e:
+        NUM_OF_CONS_ERROR = NUM_OF_CONS_ERROR+1
+        if NUM_OF_CONS_ERROR == parametreler.HATALI_DURUM_DENEME_SAYISI_SINIRI:
+            SystemExit()
+        else:
+            print(Back.RED + "Error Connecting:" + Back.RESET, e)
+            time.sleep(
+                parametreler.HATA_ALINDIGINDA_BEKLEME_SURESI)
+            getAveragePrice(baseAsset, quoteAsset)
+    return price, totalWeightUsed
+
+
+def getWallet():
+    try:
+        wallet = {}
+        timestamp = int((time.time() * 1000 - TIMESTAMP_DIFF))
+        queryPath = ("timestamp=" + str(timestamp))
+        signature = getSignature(api_secret=API_SECRET,
+                                 message=queryPath.encode('utf-8'))
+        queryPath = queryPath + "&signature=" + signature
+        url = BASE_URL + "/api/v3/account?" + queryPath
+        r = requests.get(url, headers={'X-MBX-APIKEY': API_KEY})
+        if r.status_code == 200:
+            result = json.loads(r.content)
+            for n in range(len(result["balances"])):
+                if float(result["balances"][n]["free"]) + float(result["balances"][n]["locked"]) > 0:
+                    wallet[result["balances"][n]["asset"]] = {"free": float(
+                        result["balances"][n]["free"]), "locked": float(result["balances"][n]["locked"])}
+        else:
+            print(r)
+        totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+        if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+            time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+        NUM_OF_CONS_ERROR = 0
+    except requests.exceptions.RequestException as e:
+        NUM_OF_CONS_ERROR = NUM_OF_CONS_ERROR+1
+        if NUM_OF_CONS_ERROR == parametreler.HATALI_DURUM_DENEME_SAYISI_SINIRI:
+            SystemExit()
+        else:
+            print(Back.RED + "Error Connecting:" + Back.RESET, e)
+            time.sleep(
+                parametreler.HATA_ALINDIGINDA_BEKLEME_SURESI)
+            getWallet()
+    return wallet, totalWeightUsed
+
+
+def convertSmallAssets(wallet):
+    try:
+        wallet = {}
+        timestamp = int((time.time() * 1000 - TIMESTAMP_DIFF))
+        queryPath = ("timestamp=" + str(timestamp))
+        signature = getSignature(api_secret=API_SECRET,
+                                 message=queryPath.encode('utf-8'))
+        queryPath = queryPath + "&signature=" + signature
+        url = BASE_URL + "/api/v3/account?" + queryPath
+        r = requests.get(url, headers={'X-MBX-APIKEY': API_KEY})
+        if r.status_code == 200:
+            result = json.loads(r.content)
+            for n in range(len(result["balances"])):
+                if float(result["balances"][n]["free"]) + float(result["balances"][n]["locked"]) > 0:
+                    wallet[result["balances"][n]["asset"]] = {"free": float(
+                        result["balances"][n]["free"]), "locked": float(result["balances"][n]["locked"])}
+        else:
+            print(r)
+        totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+        if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+            time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+        NUM_OF_CONS_ERROR = 0
+    except requests.exceptions.RequestException as e:
+        NUM_OF_CONS_ERROR = NUM_OF_CONS_ERROR+1
+        if NUM_OF_CONS_ERROR == parametreler.HATALI_DURUM_DENEME_SAYISI_SINIRI:
+            SystemExit()
+        else:
+            print(Back.RED + "Error Connecting:" + Back.RESET, e)
+            time.sleep(
+                parametreler.HATA_ALINDIGINDA_BEKLEME_SURESI)
+            getWallet()
+    return wallet, totalWeightUsed
+
+
+def cancelAllOrders(symbol):
+    result = ""
+    totalWeightUsed = 0
+    try:
+        timestamp = int((time.time() * 1000 - TIMESTAMP_DIFF))
+        queryPath = ("timestamp=" + str(timestamp))+"&symbol=" + symbol
+        signature = getSignature(api_secret=API_SECRET,
+                                 message=queryPath.encode('utf-8'))
+        queryPath = queryPath + "&signature=" + signature
+        url = BASE_URL + "/api/v3/openOrders?" + queryPath
+        r = requests.delete(url, headers={'X-MBX-APIKEY': API_KEY})
+        if r.status_code == 200:
+            result = json.loads(r.content)
+        elif r.status_code == 400:
+            hata = json.loads(r.content)
+            print(hata)
+            print(r)
+        else:
+            print(r)
+        totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+        if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+            time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+    except Exception as hata:
+        print("CANCEL ALL ORDER HATA İLE KATŞILAŞILDI: " + hata)
+    return result, totalWeightUsed
+
+
+def cancelOrder(symbol, orderId, origClientOrderId):
+    result = ""
+    totalWeightUsed = 0
+    try:
+        timestamp = int((time.time() * 1000 - TIMESTAMP_DIFF))
+        queryPath = ("timestamp=" + str(timestamp))+"&symbol=" + symbol + \
+            "&orderId=" + str(orderId) + \
+            "&origClientOrderId=" + origClientOrderId
+        signature = getSignature(api_secret=API_SECRET,
+                                 message=queryPath.encode('utf-8'))
+        queryPath = queryPath + "&signature=" + signature
+        url = BASE_URL + "/api/v3/order?" + queryPath
+        r = requests.delete(url, headers={'X-MBX-APIKEY': API_KEY})
+        if r.status_code == 200:
+            result = json.loads(r.content)
+        elif r.status_code == 400:
+            hata = json.loads(r.content)
+            print(hata)
+            print(r)
+        else:
+            print(r)
+        totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+        if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+            time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+    except Exception as hata:
+        print("CANCEL ORDER HATA İLE KATŞILAŞILDI: " + hata)
+    return result, totalWeightUsed
+
+
+def weighted_median(values, weights):
+    i = np.argsort(values)
+    c = np.cumsum(weights[i])
+    return values[i[np.searchsorted(c, 0.5 * c[-1])]]
+
+
+def getOrderDepths(symbol=parametreler.TO_BE_FOLLOWED, depthSize=parametreler.ALIM_SATIM_DERINLIGI):
+    asks = []
+    bids = []
+    r = 0
+    try:
+        url = BASE_URL + "/api/v3/depth?symbol=" + \
+            symbol + "&limit=" + str(depthSize)
+        r = requests.get(url, headers={'X-MBX-APIKEY': API_KEY})
+        if r.status_code == 200:
+            result = json.loads(r.content)
+            asks = np.asarray(result["asks"], dtype=np.float64)
+            bids = np.asarray(result["bids"], dtype=np.float64)
+        else:
+            print(r)
+        totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+        if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+            time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+        NUM_OF_CONS_ERROR = 0
+    except requests.exceptions.RequestException as e:
+        NUM_OF_CONS_ERROR = NUM_OF_CONS_ERROR+1
+        if NUM_OF_CONS_ERROR == parametreler.HATALI_DURUM_DENEME_SAYISI_SINIRI:
+            SystemExit()
+        else:
+            print(Back.RED + "Error Connecting:" + Back.RESET, e)
+            time.sleep(
+                parametreler.HATA_ALINDIGINDA_BEKLEME_SURESI)
+            # getOrderDepths(symbol, depthSize)
+    except requests.exceptions.ConnectionResetError:
+        print(r.content)
+    return r, asks, bids, totalWeightUsed
+
+
+def putOcoOrder(symbol, side, timeInForce="GTC", quantity=0,
+                targetPrice=0, trigerPrice=0, limitPrice=0,
+                priceFilter=parametreler.PRICE_FILTER,
+                lotSize=parametreler.LOT_SIZE):
+    try:
+        price = (np.ceil(targetPrice * 10**priceFilter)) / \
+            (10**priceFilter)
+        if side == "BUY":
+            quantity = quantity / price
+        quantity = np.trunc(quantity * 10**lotSize) / (10**lotSize)
+        timestamp = int((time.time() * 1000 - TIMESTAMP_DIFF))
+        priceStr = np.format_float_positional(price)
+        priceStr = (priceStr.replace(".", "")
+                    if priceStr[-1] == "." else priceStr)
+        quantityStr = np.format_float_positional(quantity)
+        quantityStr = (quantityStr.replace(".", "")
+                       if quantityStr[-1] == "." else quantityStr)
+        stopPriceStr = np.format_float_positional((np.ceil(trigerPrice * 10**priceFilter)) /
+                                                  (10**priceFilter))
+        stopPriceStr = (stopPriceStr.replace(".", "")
+                        if stopPriceStr[-1] == "." else stopPriceStr)
+        stopPriceStr = stopPriceStr[0:20]
+        stopLimitPriceStr = np.format_float_positional((np.ceil(limitPrice * 10**priceFilter)) /
+                                                       (10**priceFilter))
+        stopLimitPriceStr = (stopLimitPriceStr.replace(
+            ".", "") if stopLimitPriceStr[-1] == "." else stopLimitPriceStr)
+        stopLimitPriceStr = stopLimitPriceStr[0:20]
+
+        queryPath = "&symbol=" + symbol + "&side=" + side + "&quantity=" + quantityStr + "&price=" + priceStr + \
+            "&stopPrice=" + stopPriceStr+"&stopLimitPrice=" + \
+            stopLimitPriceStr + "&stopLimitTimeInForce=FOK"
+
+        queryPath = ("timestamp=" + str(timestamp))+queryPath
+        signature = getSignature(api_secret=API_SECRET,
+                                 message=queryPath.encode('utf-8'))
+        queryPath = queryPath + "&signature=" + signature
+        url = BASE_URL + "/api/v3/order/oco?" + queryPath
+        print("Request URL: " + url)
+        r = requests.post(url, headers={'X-MBX-APIKEY': API_KEY})
+        print("Gönderilen Talimat Sonucu: " + str(json.loads(r.content)))
+
+        if r.status_code == 200:
+            result = json.loads(r.content)
+            print(result)
+        elif r.status_code == 400:
+            hata = json.loads(r.content)
+            print(hata["msg"])
+            print(r)
+        else:
+            print(r)
+        totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+        if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+            time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+        NUM_OF_CONS_ERROR = 0
+
+    except requests.exceptions.RequestException as e:
+        NUM_OF_CONS_ERROR = NUM_OF_CONS_ERROR+1
+        if NUM_OF_CONS_ERROR == parametreler.HATALI_DURUM_DENEME_SAYISI_SINIRI:
+            SystemExit()
+        else:
+            print(Back.RED + "Error Connecting:" + Back.RESET, e)
+            time.sleep(
+                parametreler.HATA_ALINDIGINDA_BEKLEME_SURESI)
+    return result, totalWeightUsed
+
+
+def queryAllOcoOrders():
+    try:
+        result = pd.DataFrame()
+        timestamp = int((time.time() * 1000 - TIMESTAMP_DIFF))
+        queryPath = ("timestamp=" + str(timestamp))
+        signature = getSignature(api_secret=API_SECRET,
+                                 message=queryPath.encode('utf-8'))
+        queryPath = queryPath + "&signature=" + signature
+        url = BASE_URL + "/api/v3/allOrderList?" + queryPath
+        r = requests.get(url, headers={'X-MBX-APIKEY': API_KEY})
+        if r.status_code == 200:
+            result = json.loads(r.content)
+            result = pd.DataFrame(result, index=[0])
+        else:
+            print(r)
+        totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+        if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+            time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+        NUM_OF_CONS_ERROR = 0
+    except requests.exceptions.RequestException as e:
+        NUM_OF_CONS_ERROR = NUM_OF_CONS_ERROR+1
+        if NUM_OF_CONS_ERROR == parametreler.HATALI_DURUM_DENEME_SAYISI_SINIRI:
+            SystemExit()
+        else:
+            print(Back.RED + "Error Connecting:" + Back.RESET, e)
+            time.sleep(
+                parametreler.HATA_ALINDIGINDA_BEKLEME_SURESI)
+            queryAllOcoOrders()
+    return result, totalWeightUsed
+
+
+def queryOcoOrder(orderId, origClientOrderId):
+    try:
+        result = pd.DataFrame()
+        timestamp = int((time.time() * 1000 - TIMESTAMP_DIFF))
+        queryPath = "&orderId=" + \
+            str(orderId) + "&origClientOrderId=" + origClientOrderId
+        queryPath = ("timestamp=" + str(timestamp))+queryPath
+        signature = getSignature(api_secret=API_SECRET,
+                                 message=queryPath.encode('utf-8'))
+        queryPath = queryPath + "&signature=" + signature
+        url = BASE_URL + "/api/v3/orderList?" + queryPath
+        r = requests.get(url, headers={'X-MBX-APIKEY': API_KEY})
+        if r.status_code == 200:
+            result = json.loads(r.content)
+            result = pd.DataFrame(result, index=[0])
+        else:
+            print(r)
+        totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+        if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+            time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+        NUM_OF_CONS_ERROR = 0
+    except requests.exceptions.RequestException as e:
+        NUM_OF_CONS_ERROR = NUM_OF_CONS_ERROR+1
+        if NUM_OF_CONS_ERROR == parametreler.HATALI_DURUM_DENEME_SAYISI_SINIRI:
+            SystemExit()
+        else:
+            print(Back.RED + "Error Connecting:" + Back.RESET, e)
+            time.sleep(
+                parametreler.HATA_ALINDIGINDA_BEKLEME_SURESI)
+            queryOcoOrder(orderId, origClientOrderId)
+    return result, totalWeightUsed
+
+
+def putOrder(symbol=parametreler.TO_BE_FOLLOWED, side="BUY", orderType="LIMIT", timeInForce="GTC",
+             quantity=0, price=0, priceFilter=parametreler.PRICE_FILTER, lotSize=parametreler.LOT_SIZE):
+    try:
+        price = (np.ceil(price * 10**priceFilter)) / \
+            (10**priceFilter)
+        if side == "BUY":
+            quantity = quantity / price
+        quantity = np.trunc(quantity * 10**lotSize) / (10**lotSize)
+        timestamp = int((time.time() * 1000 - TIMESTAMP_DIFF))
+        if orderType == "LIMIT":
+            queryPath = "&symbol=" + symbol + "&side=" + side + "&type=" + orderType + \
+                "&quantity=" + (np.format_float_positional(quantity).replace(".", "") if np.format_float_positional(quantity)[-1] == "." else np.format_float_positional(quantity)) + "&price=" + \
+                (np.format_float_positional(price).replace(".", "") if np.format_float_positional(
+                    price)[-1] == "." else np.format_float_positional(price)) + "&timeInForce=" + timeInForce
+        else:
+            queryPath = "&symbol=" + symbol + "&side=" + side + "&type=" + orderType + \
+                "&quantity=" + np.format_float_positional(quantity)
+        queryPath = ("timestamp=" + str(timestamp))+queryPath
+        signature = getSignature(api_secret=API_SECRET,
+                                 message=queryPath.encode('utf-8'))
+        queryPath = queryPath + "&signature=" + signature
+        url = BASE_URL + "/api/v3/order?" + queryPath
+        print("Request URL: " + url)
+        r = requests.post(url, headers={'X-MBX-APIKEY': API_KEY})
+        # print("Gönderilen Talimat Sonucu: " + str(json.loads(r.content)))
+        if r.status_code == 200:
+            result = json.loads(r.content)
+        elif r.status_code == 400:
+            hata = json.loads(r.content)
+            print(hata["msg"])
+            print(r)
+        else:
+            print(r)
+        totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+        if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+            time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+        NUM_OF_CONS_ERROR = 0
+    except requests.exceptions.RequestException as e:
+        NUM_OF_CONS_ERROR = NUM_OF_CONS_ERROR+1
+        if NUM_OF_CONS_ERROR == parametreler.HATALI_DURUM_DENEME_SAYISI_SINIRI:
+            SystemExit()
+        else:
+            print(Back.RED + "Error Connecting:" + Back.RESET, e)
+            time.sleep(
+                parametreler.HATA_ALINDIGINDA_BEKLEME_SURESI)
+            putOrder(symbol, side, orderType, timeInForce,
+                     quantity, price, priceFilter, lotSize)
+    return result, totalWeightUsed
+
+
+def queryOrder(symbol, orderId, origClientOrderId):
+    try:
+        result = pd.DataFrame()
+        timestamp = int((time.time() * 1000 - TIMESTAMP_DIFF))
+        queryPath = "&symbol=" + symbol + "&orderId=" + str(orderId) + \
+            "&origClientOrderId=" + origClientOrderId
+        queryPath = ("timestamp=" + str(timestamp))+queryPath
+        signature = getSignature(api_secret=API_SECRET,
+                                 message=queryPath.encode('utf-8'))
+        queryPath = queryPath + "&signature=" + signature
+        url = BASE_URL + "/api/v3/order?" + queryPath
+        r = requests.get(url, headers={'X-MBX-APIKEY': API_KEY})
+        if r.status_code == 200:
+            result = json.loads(r.content)
+            result = pd.DataFrame(result, index=[0])
+        else:
+            print(r)
+        totalWeightUsed = float(r.headers["x-mbx-used-weight-1m"])
+        if totalWeightUsed > parametreler.MAX_ALLOWED_WEIGHT - parametreler.WEIGHT_BUFFER:
+            time.sleep(parametreler.WAIT_TIME_FOR_WEIGHT)
+        NUM_OF_CONS_ERROR = 0
+    except requests.exceptions.RequestException as e:
+        NUM_OF_CONS_ERROR = NUM_OF_CONS_ERROR+1
+        if NUM_OF_CONS_ERROR == parametreler.HATALI_DURUM_DENEME_SAYISI_SINIRI:
+            SystemExit()
+        else:
+            print(Back.RED + "Error Connecting:" + Back.RESET, e)
+            time.sleep(
+                parametreler.HATA_ALINDIGINDA_BEKLEME_SURESI)
+            queryOrder(symbol, orderId, origClientOrderId)
+    return result, totalWeightUsed
